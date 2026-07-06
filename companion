@@ -1,0 +1,178 @@
+"""
+Companion: Self-Forming Kernel + Google Gemini
+================================================
+
+Connects the astrocyte-consolidating memory kernel to Google's Gemini API,
+so the memory substrate individuates through *real* conversation, not toy
+topic vectors.
+
+Setup
+-----
+1. Get a free Gemini API key: https://aistudio.google.com/apikey
+2. pip install google-genai numpy
+3. Set your API key as an environment variable (recommended, keeps it out
+   of any shared/committed code):
+
+     export GEMINI_API_KEY="your-key-here"      # Mac/Linux
+     setx GEMINI_API_KEY "your-key-here"        # Windows
+
+   Or, if running in a notebook (e.g. Google Colab), set it directly:
+
+     import os
+     os.environ["GEMINI_API_KEY"] = "your-key-here"
+
+4. Run: python companion.py
+
+How it works
+------------
+- Gemini's embedding model turns your message into a vector.
+- That vector is projected down to the kernel's dimensionality (N=64) and
+  fed to kernel.encounter() -- this is where memory forms.
+- Valence (how emotionally/behaviorally significant the message seems) is
+  estimated with a lightweight heuristic (see estimate_valence()) -- this
+  is intentionally simple; replace it with something better if you have
+  ideas (e.g. asking Gemini itself to rate valence, or hooking up a real
+  sentiment/arousal classifier).
+- Before generating a reply, the kernel's resonance() score for the
+  current message is computed and passed to Gemini as context, along
+  with a short natural-language description of related memories -- Gemini
+  writes the actual reply.
+- The memory itself (the kernel's C and R matrices) is NOT shown to the
+  user directly, but you can inspect it with kernel.resonance(...) at any
+  time -- see the debug commands in the chat loop.
+
+This is a reference implementation, not a finished product. In
+particular:
+- The embedding-to-N64 projection is a fixed random projection (seeded),
+  which is simple but lossy. A learned or PCA-based projection would
+  likely work better.
+- estimate_valence() is a placeholder heuristic -- it does not
+  faithfully capture emotional significance.
+- There is no persistence across separate runs (the kernel resets when
+  the program exits) -- add save/load of kernel.R and kernel.C (both are
+  plain NumPy arrays; np.save / np.load work fine) if you want a
+  companion that remembers across sessions.
+"""
+
+import os
+import sys
+import numpy as np
+
+try:
+    from google import genai
+except ImportError:
+    print("Missing dependency. Run: pip install google-genai")
+    sys.exit(1)
+
+sys.path.insert(0, os.path.dirname(__file__))
+from self_forming_kernel.kernel import Kernel, make_law, N_DEFAULT
+
+EMBEDDING_MODEL = "gemini-embedding-001"
+CHAT_MODEL = "gemini-2.5-flash"  # stable as of 2026; swap to a newer model
+                                  # name if Google has released one since
+
+
+def get_client() -> "genai.Client":
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        print("Set GEMINI_API_KEY first (see the docstring at the top of this file).")
+        sys.exit(1)
+    return genai.Client(api_key=api_key)
+
+
+def embed_text(client: "genai.Client", text: str) -> np.ndarray:
+    """Turn text into a real semantic embedding via Gemini."""
+    result = client.models.embed_content(model=EMBEDDING_MODEL, contents=text)
+    return np.array(result.embeddings[0].values, dtype=float)
+
+
+def make_projection(embedding_dim: int, kernel_dim: int, seed: int = 0) -> np.ndarray:
+    """A fixed random projection from Gemini's embedding space down to the
+    kernel's (smaller) state space. Simple, lossy, but consistent."""
+    rng = np.random.default_rng(seed)
+    P = rng.standard_normal((kernel_dim, embedding_dim))
+    P /= np.linalg.norm(P, axis=1, keepdims=True)
+    return P
+
+
+def estimate_valence(text: str) -> float:
+    """Placeholder heuristic for emotional/behavioral significance, in
+    [0, 1]. Replace with something better (e.g. a real sentiment model,
+    or ask Gemini to self-rate) if you want this to be meaningful.
+    For now: longer, more exclamation-heavy, or emotionally-worded
+    messages score higher -- crude, but enough to demonstrate the
+    mechanism."""
+    text_l = text.lower()
+    score = 0.3  # baseline
+    score += 0.15 * min(text.count("!"), 3)
+    emotional_words = ["love", "hate", "amazing", "terrible", "important",
+                       "worried", "excited", "scared", "happy", "sad",
+                       "å¤§å¥½ã", "å«ã", "ããã", "ææª", "å¤§äº", "å¿é", "å¬ãã", "æ²ãã"]
+    score += 0.1 * sum(1 for w in emotional_words if w in text_l)
+    return float(np.clip(score, 0.0, 1.0))
+
+
+def main():
+    client = get_client()
+    W = make_law(seed=0)
+    kernel = Kernel(W)
+    projection = None  # built on first message, once we know Gemini's embedding size
+
+    print("=== Self-Forming Companion (Gemini + astrocyte-consolidating memory) ===")
+    print("Type a message. Commands: /resonance <text>  /quit\n")
+
+    history = []
+
+    while True:
+        user_input = input("You: ").strip()
+        if not user_input:
+            continue
+        if user_input == "/quit":
+            break
+        if user_input.startswith("/resonance "):
+            probe = user_input[len("/resonance "):]
+            emb = embed_text(client, probe)
+            if projection is None:
+                projection = make_projection(len(emb), N_DEFAULT)
+            vec = projection @ emb
+            print(f"  [resonance for '{probe}': {kernel.resonance(vec):.3f}]")
+            continue
+
+        # 1. embed the message, project into kernel space
+        emb = embed_text(client, user_input)
+        if projection is None:
+            projection = make_projection(len(emb), N_DEFAULT)
+        vec = projection @ emb
+
+        # 2. check resonance BEFORE encoding (how familiar does this already feel?)
+        familiarity = kernel.resonance(vec)
+
+        # 3. estimate valence and let the memory form
+        valence = estimate_valence(user_input)
+        kernel.encounter(vec, valence=valence)
+
+        # 4. build a short memory-context note for Gemini (not shown to user)
+        if familiarity > 0.6:
+            memory_note = "This topic feels very familiar -- you've discussed it a lot before."
+        elif familiarity > 0.3:
+            memory_note = "This topic feels somewhat familiar."
+        else:
+            memory_note = "This topic feels new."
+
+        history.append(f"User: {user_input}")
+        prompt = (
+            "You are a conversational companion with a memory system. "
+            f"[Internal memory signal, do not mention explicitly: {memory_note} "
+            f"(familiarity={familiarity:.2f}, estimated significance={valence:.2f})]\n\n"
+            + "\n".join(history[-10:])
+            + "\nAssistant:"
+        )
+
+        response = client.models.generate_content(model=CHAT_MODEL, contents=prompt)
+        reply = response.text
+        history.append(f"Assistant: {reply}")
+        print(f"\nCompanion: {reply}\n")
+
+
+if __name__ == "__main__":
+    main()
